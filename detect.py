@@ -9,7 +9,6 @@ from curl_cffi import requests as creq
 
 BASE = "https://www.fwd.com.hk"
 PATH = "/regulatory-disclosures/fulfillment-ratios/"
-WORDS = ["分紅實現率", "總價值比率", "總現金價值", "週年紅利", "特別紅利", "歸原紅利", "保單年度", "不適用", "美元", "港元"]
 
 
 def get(url):
@@ -17,76 +16,117 @@ def get(url):
     return r.status_code, r.content.decode("utf-8", "replace")
 
 
-def unesc(s):
-    for a, b in (('\\"', '"'), ("\\u003c", "<"), ("\\u003e", ">"), ("\\u0026", "&"), ("\\n", " "), ("\\/", "/")):
-        s = s.replace(a, b)
-    return s
-
-
 def clean(s):
-    s = re.sub(r"<(script|style)\b.*?</\1>", " ", s, flags=re.S | re.I)
-    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"<[^>]+>", " ", str(s or ""))
     return re.sub(r"\s+", " ", htmllib.unescape(s)).strip()
 
 
-def flat(s):
-    return re.sub(r"\s+", " ", s)
+def is_cells(o):
+    return (isinstance(o, list) and len(o) > 0
+            and all(isinstance(x, dict) and "content" in x for x in o)
+            and any("row_span" in x or "column_span" in x for x in o))
+
+
+def walk(o, path, out):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            walk(v, path + (k,), out)
+    elif isinstance(o, list):
+        if is_cells(o):
+            out.append(path)
+            return
+        for i, v in enumerate(o):
+            walk(v, path + (i,), out)
+
+
+def resolve(root, path):
+    for k in path:
+        root = root[k]
+    return root
+
+
+def load(slug):
+    st, raw = get(BASE + "/zh" + PATH + slug + "/")
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, flags=re.S)
+    if st != 200 or not m:
+        return st, None, {}
+    root = json.loads(m.group(1))
+    out = []
+    walk(root, (), out)
+    tables = {}
+    for p in out:
+        idx = [i for i, x in enumerate(p) if isinstance(x, int)]
+        tid = p[:idx[-1]] if idx else p
+        tables.setdefault(tid, []).append(p)
+    return st, root, tables
+
+
+def cell_text(c):
+    t = clean(c.get("content"))[:18] or "∅"
+    rs, cs = c.get("row_span"), c.get("column_span")
+    if rs not in (None, 1, "1"):
+        t += f"[r{rs}]"
+    if cs not in (None, 1, "1"):
+        t += f"[c{cs}]"
+    return t
+
+
+def show(slug):
+    st, root, tables = load(slug)
+    print(f"=== 樣本：{slug}｜狀態 {st}｜表格 {len(tables)} 個 ===")
+    for n, (tid, rows) in enumerate(list(tables.items())[:4], 1):
+        print(f"-- 表 {n}｜{len(rows)} 行｜路徑尾 {'/'.join(str(x) for x in tid[-5:])}")
+        up, shown = tid[:-1], 0
+        while shown < 3:
+            try:
+                d = resolve(root, up)
+            except Exception:
+                break
+            if isinstance(d, dict):
+                vals = [f"{k}={clean(v)[:40]}" for k, v in d.items()
+                        if isinstance(v, str) and 0 < len(clean(v)) <= 60][:8]
+                print(f"   上層{shown + 1} 鍵 {list(d.keys())[:10]}")
+                if vals:
+                    print("   文字：" + "｜".join(vals))
+                shown += 1
+            if not up:
+                break
+            up = up[:-1]
+        for p in rows[:25]:
+            cells = resolve(root, p)
+            print(f"   ({len(cells)}格) " + " | ".join(cell_text(c) for c in cells[:16]))
+        if len(rows) > 25:
+            print(f"   …其餘 {len(rows) - 25} 行略")
 
 
 status, body = get(BASE + "/zh" + PATH)
 slugs = list(dict.fromkeys(re.findall(re.escape(PATH) + r"([A-Za-z0-9_\-]+)", body)))
-print("=== 產品頁 ===")
-print(f"總頁狀態 {status}｜產品頁 {len(slugs)} 個")
-for i in range(0, len(slugs), 3):
-    print("  " + "｜".join(slugs[i:i + 3]))
+print("=== 全部產品頁（表格數/行數/百分比格數）===")
+stats, line = [], []
+for s in slugs:
+    try:
+        st, root, tables = load(s)
+        nrow = sum(len(r) for r in tables.values())
+        npct = sum(1 for rows in tables.values() for p in rows for c in resolve(root, p)
+                   if re.search(r"\d\s*%", clean(c.get("content"))))
+        stats.append((s, len(tables), nrow, npct))
+        line.append(f"{s[:28]} {len(tables)}/{nrow}/{npct}")
+    except Exception as e:
+        stats.append((s, 0, 0, 0))
+        line.append(f"{s[:28]} 失敗:{str(e)[:30]}")
+    if len(line) == 3:
+        print("  " + "｜".join(line))
+        line = []
+if line:
+    print("  " + "｜".join(line))
+print(f"合計：{len(stats)} 頁｜表格 {sum(x[1] for x in stats)}｜行 {sum(x[2] for x in stats)}"
+      f"｜百分比格 {sum(x[3] for x in stats)}｜沒有表格的頁 {sum(1 for x in stats if x[1] == 0)}")
 
 picks = []
-for s in ([slugs[0], slugs[len(slugs) // 2], slugs[-1]] if slugs else []):
-    if s not in picks:
-        picks.append(s)
-
-for n, slug in enumerate(picks, 1):
-    print(f"=== 樣本 {n}：{slug} ===")
-    url = BASE + "/zh" + PATH + slug + "/"
-    st, raw = get(url)
-    if st != 200:
-        print(f"  /zh 狀態 {st}，改試沒有 /zh")
-        st, raw = get(BASE + PATH + slug + "/")
-    b = unesc(raw)
-    title = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.S | re.I)
-    print(f"狀態 {st}｜長度 {len(raw)}｜標題 {clean(title.group(1))[:50] if title else '沒有'}")
-    t1 = re.findall(r"<table\b.*?</table>", raw, flags=re.S | re.I)
-    t2 = re.findall(r"<table\b.*?</table>", b, flags=re.S | re.I)
-    print(f"表格：原文 {len(t1)} 個｜還原後 {len(t2)} 個")
-    print("關鍵字：", "｜".join(f"{w} {b.count(w)}" for w in WORDS))
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, flags=re.S)
-    if m:
-        try:
-            d = json.loads(m.group(1))
-            pp = d.get("props", {}).get("pageProps", {})
-            print(f"NEXT_DATA：page {d.get('page')}｜pageProps 鍵 {list(pp.keys())[:12]}")
-        except Exception as e:
-            print(f"NEXT_DATA 解析失敗：{e}")
-    else:
-        print("NEXT_DATA：沒有")
-    hits = list(re.finditer(r"\d{2,3}(?:\.\d+)?\s*%", b))
-    print(f"百分比數值 {len(hits)} 個")
-    for t in (t2 or t1)[:2]:
-        rows = re.findall(r"<tr\b.*?</tr>", t, flags=re.S | re.I)
-        print(f"  表格 {len(rows)} 行：")
-        for tr in rows[:6]:
-            cells = [clean(c)[:14] for c in re.findall(r"<t[hd]\b[^>]*>(.*?)</t[hd]>", tr, flags=re.S | re.I)]
-            print("     " + " | ".join(cells[:14]))
-    if hits:
-        p = hits[0].start()
-        print("  第一個百分比附近原文：")
-        print("  " + flat(b[max(0, p - 450):p + 250]))
-        if len(hits) > 1:
-            p = hits[-1].start()
-            print("  最後一個百分比附近原文：")
-            print("  " + flat(b[max(0, p - 250):p + 150]))
-    else:
-        p = max(b.rfind("週年紅利"), b.rfind("特別紅利"))
-        print("  沒有百分比，紅利字眼附近原文：")
-        print("  " + (flat(b[max(0, p - 350):p + 350]) if p >= 0 else "找不到"))
+if stats:
+    for s in (stats[0][0], max(stats, key=lambda x: x[2])[0]):
+        if s not in picks:
+            picks.append(s)
+for s in picks:
+    show(s)
 print("=== 完 ===")
