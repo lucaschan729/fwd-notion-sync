@@ -12,12 +12,15 @@ from curl_cffi import requests as creq
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.properties import PageSetupProperties
 
 BASE = "https://www.fwd.com.hk"
 PATH = "/regulatory-disclosures/fulfillment-ratios/"
 LABELS = [str(i) for i in range(1, 11)] + ["10+"]
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ASCII_NAME = "FWD_fulfillment_auto.xlsx"
+NAVY = "1F3864"
+TYPE_COLORS = {"週年紅利": "1F4E78", "特別紅利": "C55A11", "歸原紅利": "548235"}
 
 
 def get(url):
@@ -84,11 +87,15 @@ def to_val(s):
     return round(float(m.group(1)) / 100, 6) if m else "/"
 
 
-def parse_page(slug, raw, years):
+def name_key(name):
+    return re.sub(r"\s+", "", name)
+
+
+def parse_page(slug, raw, years, seen, dups):
     m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, flags=re.S)
     if not m:
         raise RuntimeError("沒有 NEXT_DATA")
-    secs, recs, seen = [], [], set()
+    secs, recs = [], []
     find_sections(json.loads(m.group(1)), secs)
     for sec in secs:
         rows = []
@@ -96,12 +103,14 @@ def parse_page(slug, raw, years):
         if not rows:
             continue
         texts = [[clean(c.get("content")) for c in r] for r in rows]
-        sig = json.dumps(texts, ensure_ascii=False)
-        if sig in seen:
-            continue
-        seen.add(sig)
         name, cat, year = parse_desc(clean(sec.get("description")))
         name = name or clean(sec.get("title")) or slug
+        sig = json.dumps([name_key(name), texts], ensure_ascii=False)
+        if sig in seen:
+            if seen[sig] != slug:
+                dups.append(f"{name}（{slug} 與 {seen[sig]} 相同）")
+            continue
+        seen[sig] = slug
         head = next((t for t in texts if sum(1 for x in t if re.search(r"年度\s*\d", x)) >= 3), None)
         colmap, cur_idx = {}, None
         if head:
@@ -146,230 +155,242 @@ def group_of(typ):
     return typ or "其他"
 
 
-def pool(rs, labs):
-    return [r["vals"][lab] for r in rs for lab in labs if isinstance(r["vals"].get(lab), float)]
-
-
-def mean(v):
-    return sum(v) / len(v) if v else None
-
-
 def avg(rs, lab):
-    v = pool(rs, [lab])
-    return mean(v), len(v)
+    v = [r["vals"][lab] for r in rs if isinstance(r["vals"].get(lab), float)]
+    return (sum(v) / len(v), len(v)) if v else (None, 0)
+
+
+def products(recs):
+    out = {}
+    for x in recs:
+        p = out.setdefault(name_key(x["name"]), {"name": x["name"], "cat": x["cat"],
+                                                 "curs": [], "rows": 0, "vals": []})
+        p["rows"] += 1
+        if not p["cat"] and x["cat"]:
+            p["cat"] = x["cat"]
+        if x["cur"] and x["cur"] not in p["curs"]:
+            p["curs"].append(x["cur"])
+        p["vals"] += [v for v in x["vals"].values() if isinstance(v, float)]
+    return list(out.values())
 
 
 def build_excel(recs, years, year, path, n_pages):
-    today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d")
     wb = Workbook()
     ov = wb.active
     ov.title = "概覽"
-    sname = f"{year}分紅實現率"
-    ws = wb.create_sheet(sname)
+    ws = wb.create_sheet("分紅實現率")
+    pl = wb.create_sheet("產品一覽")
+    ov.sheet_properties.tabColor = NAVY
+    ws.sheet_properties.tabColor = "2E75B6"
+    pl.sheet_properties.tabColor = "7030A0"
+
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    head_fill = PatternFill("solid", fgColor="1F4E78")
-    sub_fill = PatternFill("solid", fgColor="DDEBF7")
+    navy_fill = PatternFill("solid", fgColor=NAVY)
+    head_fill = PatternFill("solid", fgColor="2E75B6")
+    card_fill = PatternFill("solid", fgColor="DDEBF7")
     sep_fill = PatternFill("solid", fgColor="F2F2F2")
     green = PatternFill("solid", fgColor="E2F0D9")
     red = PatternFill("solid", fgColor="FCE4E4")
     white = PatternFill("solid", fgColor="FFFFFF")
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    title_font = Font(bold=True, size=14, color="1F4E78")
-    sec_font = Font(bold=True, size=12, color="1F4E78")
-    note_font = Font(size=9, color="7F7F7F")
-    white_bold = Font(bold=True, color="FFFFFF")
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    prods = products(recs)
+    nums = [v for rec in recs for v in rec["vals"].values() if isinstance(v, float)]
+
+    def pct_fmt(v, base="0%"):
+        return base if abs(v * 100 - round(v * 100)) < 1e-6 else "0.0%"
+
+    def banner(sh, text, ncols, note):
+        last = get_column_letter(ncols)
+        sh.merge_cells(f"A1:{last}1")
+        sh["A1"] = text
+        sh["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+        sh["A1"].fill = navy_fill
+        sh["A1"].alignment = left
+        sh.row_dimensions[1].height = 32
+        sh.merge_cells(f"A2:{last}2")
+        sh["A2"] = note
+        sh["A2"].font = Font(size=9, color="7F7F7F")
+        sh["A2"].alignment = left
+        sh.row_dimensions[2].height = 20
+        sh.sheet_view.showGridLines = False
+
+    def head_row(sh, row, heads, height=34):
+        for c, h in enumerate(heads, 1):
+            cell = sh.cell(row=row, column=c, value=h)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = head_fill
+            cell.alignment = center
+            cell.border = border
+        sh.row_dimensions[row].height = height
+
+    def ratio_cell(cell, v, fmt=None):
+        cell.alignment = center
+        cell.border = border
+        cell.fill = white
+        if isinstance(v, float):
+            cell.value = v
+            cell.number_format = fmt or pct_fmt(v)
+            if v >= 1:
+                cell.fill = green
+                cell.font = Font(color="375623")
+            elif v < 0.8:
+                cell.fill = red
+                cell.font = Font(color="C00000")
+            else:
+                cell.font = Font(color="262626")
+        else:
+            cell.value = "/"
+            cell.font = Font(color="BFBFBF")
+
+    def setup_print(sh, rows):
+        sh.page_setup.orientation = "landscape"
+        sh.page_setup.fitToWidth = 1
+        sh.page_setup.fitToHeight = 0
+        sh.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        sh.print_title_rows = rows
+
+    year_heads = [f"保單年度 {lab}" + (f"\n({years[lab]})" if lab in years else "") for lab in LABELS]
+
+    # ---------- 分紅實現率 ----------
     ncol = 4 + len(LABELS)
     last = get_column_letter(ncol)
-
-    def rate(sheet, r, c, v, fmt):
-        cell = sheet.cell(row=r, column=c, value=v if v is not None else "/")
-        cell.alignment = center
-        cell.border = border
-        if isinstance(v, float):
-            cell.number_format = fmt
-            cell.fill = green if round(v, 6) >= 1 else (red if v < 0.8 else white)
-        else:
-            cell.font = Font(color="BFBFBF")
-        return cell
-
-    def head(sheet, r, c, v, fill=head_fill, font=white_bold):
-        cell = sheet.cell(row=r, column=c, value=v)
-        cell.font = font
-        cell.fill = fill
-        cell.alignment = center
-        cell.border = border
-        return cell
-
-    # ---------- 資料工作表 ----------
-    notes = [
-        (f"富衛分紅實現率（報告年度 {year}）", title_font, 26),
-        ("分紅實現率＝實際派發的非保證紅利 ÷ 銷售時說明的金額。100% 即與預期一致，高於 100% 即比預期多。定義以富衛網站的說明為準。", Font(size=10, color="404040"), 20),
-        ("綠色＝100% 或以上；紅色＝低於 80%；「/」＝網站顯示「不適用」。", Font(size=10, color="404040"), 18),
-        (f"資料來源：富衛香港網站（報告年度 {year}）｜更新日期：{today}", note_font, 18),
-    ]
-    for i, (text, font, h) in enumerate(notes, 1):
-        ws.merge_cells(f"A{i}:{last}{i}")
-        ws.cell(row=i, column=1, value=text).font = font
-        ws.cell(row=i, column=1).alignment = left
-        ws.row_dimensions[i].height = h
-    HR = len(notes) + 1
-    heads = ["產品名稱", "產品種類", "貨幣", "紅利類型"] + [
-        f"保單年度{lab}" + (f"\n{years[lab]}" if lab in years else "") for lab in LABELS]
-    for c, h in enumerate(heads, 1):
-        head(ws, HR, c, h)
-    ws.row_dimensions[HR].height = 36
-
-    r, prev = HR + 1, None
+    banner(ws, f"富衛 FWD 分紅實現率（{year} 年度）", ncol,
+           "資料來源：富衛香港官方網站｜「/」代表不適用｜綠色為 100% 或以上，紅色為低於 80%｜括號內為保單發出年份｜過往表現不代表未來")
+    head_row(ws, 3, ["產品類別", "產品名稱", "紅利類型", "貨幣"] + year_heads)
+    r, prev = 4, None
     for rec in recs:
-        key = (rec["slug"], rec["name"])
+        key = (rec["slug"], name_key(rec["name"]))
         if prev is not None and key != prev:
             ws.merge_cells(f"A{r}:{last}{r}")
             ws.cell(row=r, column=1).fill = sep_fill
             ws.row_dimensions[r].height = 6
             r += 1
         prev = key
-        for c, v in enumerate([rec["name"], rec["cat"], rec["cur"], rec["typ"]], 1):
+        for c, v in enumerate([rec["cat"], rec["name"], rec["typ"], rec["cur"]], 1):
             cell = ws.cell(row=r, column=c, value=v)
             cell.border = border
             cell.fill = white
             cell.alignment = left if c <= 2 else center
             if c == 1:
-                cell.font = Font(bold=True, color="262626")
+                cell.font = Font(color="7F7F7F", size=10)
             elif c == 2:
-                cell.font = Font(color="595959")
+                cell.font = Font(bold=True, color="262626")
             elif c == 3:
+                cell.font = Font(bold=True, color=TYPE_COLORS.get(group_of(rec["typ"]), "404040"))
+            else:
                 cell.font = Font(bold=True, color="7030A0")
         for c, lab in enumerate(LABELS, 5):
-            v = rec["vals"].get(lab, "/")
-            fmt = "0%"
-            if isinstance(v, float) and abs(v * 100 - round(v * 100)) > 1e-6:
-                fmt = "0.0%"
-            rate(ws, r, c, v if isinstance(v, float) else None, fmt)
-        ws.row_dimensions[r].height = 20
+            ratio_cell(ws.cell(row=r, column=c), rec["vals"].get(lab, "/"))
+        ws.row_dimensions[r].height = 21
         r += 1
-    data_end = r - 1
-    ws.auto_filter.ref = f"A{HR}:{last}{data_end}"
-    ws.freeze_panes = f"B{HR + 1}"
-    for c, w in enumerate([38, 26, 10, 14] + [12] * len(LABELS), 1):
+    for c, w in enumerate([20, 36, 12, 10] + [11] * len(LABELS), 1):
         ws.column_dimensions[get_column_letter(c)].width = w
+    ws.freeze_panes = "E4"
+    ws.auto_filter.ref = f"A3:{last}{r - 1}"
+    setup_print(ws, "1:3")
 
-    # ---------- 平均值摘要（工作表最底）----------
-    groups = ["所有紅利"] + list(dict.fromkeys(group_of(x["typ"]) for x in recs))
-
-    def rows_of(g):
-        return recs if g == "所有紅利" else [x for x in recs if group_of(x["typ"]) == g]
-
-    r += 1
-    ws.cell(row=r, column=4, value="平均值摘要").font = sec_font
-    r += 1
-    cum_heads = ["所有年份平均值"] + [f"持滿{n}年平均值" for n in range(2, 10)] + ["第10年平均值", "持滿10年+平均值"]
-    head(ws, r, 4, "分紅類型")
-    for c, h in enumerate(cum_heads, 5):
-        head(ws, r, c, h)
-    ws.row_dimensions[r].height = 34
-    r += 1
-    for g in groups:
-        cell = ws.cell(row=r, column=4, value=g)
-        cell.font = Font(bold=True)
-        cell.alignment = center
-        cell.border = border
-        for i in range(len(LABELS)):
-            rate(ws, r, 5 + i, mean(pool(rows_of(g), LABELS[i:])), "0.00%")
-        ws.row_dimensions[r].height = 20
-        r += 1
-    head(ws, r, 4, "當年平均值", sub_fill, Font(bold=True, color="1F4E78"))
-    for c, lab in enumerate(LABELS, 5):
-        head(ws, r, c, years.get(lab, lab), sub_fill, Font(bold=True, color="1F4E78"))
-    r += 1
-    cell = ws.cell(row=r, column=4, value="所有紅利")
-    cell.font = Font(bold=True)
-    cell.alignment = center
-    cell.border = border
-    for c, lab in enumerate(LABELS, 5):
-        rate(ws, r, c, mean(pool(recs, [lab])), "0.00%")
-    ws.row_dimensions[r].height = 20
-    r += 1
-    ws.merge_cells(f"D{r}:{last}{r}")
-    ws.cell(row=r, column=4, value="「持滿N年平均值」＝保單年度N及之後所有數字的平均；「當年平均值」＝該年度一欄所有數字的平均。平均值計入所有貨幣，為固定數字，不會隨篩選變動。").font = note_font
-    ws.cell(row=r, column=4).alignment = left
-    ws.row_dimensions[r].height = 30
+    # ---------- 產品一覽 ----------
+    banner(pl, f"富衛 FWD 產品一覽（{year} 年度）｜共 {len(prods)} 個產品", 8,
+           "每個產品一行（同名產品只算一次）｜平均、最低、最高按該產品所有有數值的格計算")
+    head_row(pl, 3, ["產品名稱", "產品類別", "貨幣", "資料行數", "數值格數", "平均", "最低", "最高"], 26)
+    for i, p in enumerate(prods, 4):
+        v = p["vals"]
+        row = [p["name"], p["cat"], "、".join(p["curs"]), p["rows"], len(v)]
+        for c, x in enumerate(row, 1):
+            cell = pl.cell(row=i, column=c, value=x)
+            cell.border = border
+            cell.alignment = left if c <= 3 else center
+            if c == 1:
+                cell.font = Font(bold=True, color="262626")
+            elif c == 2:
+                cell.font = Font(color="7F7F7F", size=10)
+            elif c == 3:
+                cell.font = Font(bold=True, color="7030A0")
+        ratio_cell(pl.cell(row=i, column=6), sum(v) / len(v) if v else "/", "0.0%")
+        ratio_cell(pl.cell(row=i, column=7), min(v) if v else "/")
+        ratio_cell(pl.cell(row=i, column=8), max(v) if v else "/")
+        pl.row_dimensions[i].height = 21
+    for c, w in enumerate([38, 22, 26, 10, 10, 10, 10, 10], 1):
+        pl.column_dimensions[get_column_letter(c)].width = w
+    pl.freeze_panes = "B4"
+    pl.auto_filter.ref = f"A3:H{len(prods) + 3}"
+    setup_print(pl, "1:3")
 
     # ---------- 概覽 ----------
-    nums = pool(recs, LABELS)
-    ov["A1"] = f"富衛分紅表現概覽（報告年度 {year}）"
-    ov["A1"].font = title_font
-    ov.row_dimensions[1].height = 26
-    ov["A2"] = f"資料來源：富衛香港網站｜更新日期：{today}"
-    ov["A2"].font = note_font
+    ocol = len(LABELS) + 2
+    banner(ov, f"富衛 FWD 分紅實現率概覽（{year} 年度）", ocol,
+           f"資料來源：富衛香港官方網站｜產生時間（香港）{now}｜讀取產品頁 {n_pages} 個")
+    n = len(nums) or 1
+    cards = [
+        ("產品數", len(prods), "0"),
+        ("資料行數", len(recs), "0"),
+        ("有數值格數", len(nums), "0"),
+        ("整體平均", sum(nums) / n, "0.0%"),
+        ("100% 或以上佔比", sum(1 for v in nums if v >= 1) / n, "0.0%"),
+        ("低於 80% 佔比", sum(1 for v in nums if v < 0.8) / n, "0.0%"),
+    ]
+    for i, (k, v, fmt) in enumerate(cards):
+        c = 1 + 2 * i
+        ov.merge_cells(start_row=4, start_column=c, end_row=4, end_column=c + 1)
+        ov.merge_cells(start_row=5, start_column=c, end_row=5, end_column=c + 1)
+        a = ov.cell(row=4, column=c, value=k)
+        a.font = Font(bold=True, size=10, color="595959")
+        a.fill = card_fill
+        a.alignment = center
+        b = ov.cell(row=5, column=c, value=v)
+        b.font = Font(bold=True, size=18, color=NAVY)
+        b.fill = card_fill
+        b.alignment = center
+        b.number_format = fmt
+    ov.row_dimensions[4].height = 22
+    ov.row_dimensions[5].height = 38
 
-    ov["A4"] = "資料概況"
-    ov["A4"].font = sec_font
-    for c, h in enumerate(["工作表", "產品數", "行數", "有數字的格數", "整體平均值", "低於 80% 的比例"], 1):
-        head(ov, 5, c, h)
-    link = ov.cell(row=6, column=1, value=sname)
-    link.hyperlink = f"#'{sname}'!A1"
-    link.font = Font(color="0563C1", underline="single")
-    link.border = border
-    link.alignment = center
-    stats = [len({(x["slug"], x["name"]) for x in recs}), len(recs), len(nums)]
-    for c, v in enumerate(stats, 2):
-        cell = ov.cell(row=6, column=c, value=v)
-        cell.alignment = center
-        cell.border = border
-    rate(ov, 6, 5, mean(nums), "0.00%")
-    cell = ov.cell(row=6, column=6, value=(sum(1 for v in nums if v < 0.8) / len(nums)) if nums else "/")
-    cell.number_format = "0.0%"
-    cell.alignment = center
-    cell.border = border
+    def avg_table(top, title, groups):
+        ov.cell(row=top, column=1, value=title).font = Font(bold=True, size=12, color=NAVY)
+        ov.row_dimensions[top].height = 24
+        head_row(ov, top + 1, ["項目"] + year_heads + ["數值格數"])
+        for i, (g, rs) in enumerate(groups, top + 2):
+            cell = ov.cell(row=i, column=1, value=g)
+            cell.font = Font(bold=True, color=TYPE_COLORS.get(g, "262626"))
+            cell.border = border
+            cell.alignment = left
+            total = 0
+            for c, lab in enumerate(LABELS, 2):
+                a, cnt = avg(rs, lab)
+                total += cnt
+                ratio_cell(ov.cell(row=i, column=c), a if a is not None else "/", "0.00%")
+            cell = ov.cell(row=i, column=ocol, value=total)
+            cell.alignment = center
+            cell.border = border
+            ov.row_dimensions[i].height = 22
+        return top + 2 + len(groups)
 
-    ov["A8"] = "按產品種類的整體平均值"
-    ov["A8"].font = sec_font
-    head(ov, 9, 1, "產品種類")
-    head(ov, 9, 2, "分紅實現率")
-    rr = 10
-    for cat in dict.fromkeys(x["cat"] or "未識別類別" for x in recs):
-        rs = [x for x in recs if (x["cat"] or "未識別類別") == cat]
-        cell = ov.cell(row=rr, column=1, value=cat)
-        cell.border = border
+    types = list(dict.fromkeys(group_of(x["typ"]) for x in recs))
+    nxt = avg_table(7, "各保單年度平均分紅實現率（按紅利類型）",
+                    [("所有紅利", recs)] + [(g, [x for x in recs if group_of(x["typ"]) == g]) for g in types])
+    cats = list(dict.fromkeys(x["cat"] or "未識別類別" for x in recs))
+    nxt = avg_table(nxt + 1, "各保單年度平均分紅實現率（按產品類別）",
+                    [(g, [x for x in recs if (x["cat"] or "未識別類別") == g]) for g in cats])
+    notes = [
+        "說明",
+        "・分紅實現率＝實際派發的非保證紅利 ÷ 銷售時建議書上的預計金額；100% 代表與預計相同。",
+        "・產品數按產品名稱計算，同名產品只算一次；詳細名單見「產品一覽」工作表。",
+        "・「/」代表富衛沒有公佈該保單年度的數值（不適用）。",
+        "・過往表現不代表未來。官方網頁：" + BASE + "/zh" + PATH,
+    ]
+    for i, t in enumerate(notes, nxt + 1):
+        ov.merge_cells(start_row=i, start_column=1, end_row=i, end_column=ocol)
+        cell = ov.cell(row=i, column=1, value=t)
+        cell.font = Font(bold=True, color=NAVY) if i == nxt + 1 else Font(size=10, color="595959")
         cell.alignment = left
-        rate(ov, rr, 2, mean(pool(rs, LABELS)), "0.00%")
-        rr += 1
-
-    rr += 1
-    ov.cell(row=rr, column=1, value="顏色說明").font = sec_font
-    rr += 1
-    legend = [
-        ("100%", green, "100% 或以上：與銷售時的說明一致或更好"),
-        ("79%", red, "低於 80%：明顯低於銷售時的說明"),
-        ("/", white, "沒有數字：網站顯示「不適用」"),
-    ]
-    for sample, fill, text in legend:
-        cell = ov.cell(row=rr, column=1, value=sample)
-        cell.fill = fill
-        cell.alignment = center
-        cell.border = border
-        ov.cell(row=rr, column=2, value=text)
-        rr += 1
-
-    rr += 1
-    ov.cell(row=rr, column=1, value="使用提示").font = sec_font
-    rr += 1
-    tips = [
-        "・點上方「資料概況」的工作表名稱，可直接跳到該工作表。",
-        f"・工作表第 {HR} 行有篩選箭嘴，可按產品種類、貨幣或紅利類型篩選。",
-        "・向右或向下捲動時，標題列和產品名稱會固定不動。",
-        "・平均值摘要在工作表最底部。",
-        "・手機預覽未必顯示全部格式，建議下載後用 Excel App 開啟。",
-        "・過往表現不代表未來。",
-    ]
-    for t in tips:
-        ov.cell(row=rr, column=1, value=t)
-        rr += 1
-    ov.column_dimensions["A"].width = 34
-    for c in range(2, 7):
-        ov.column_dimensions[get_column_letter(c)].width = 16
+        ov.row_dimensions[i].height = 20
+    ov.column_dimensions["A"].width = 24
+    for c in range(2, ocol + 1):
+        ov.column_dimensions[get_column_letter(c)].width = 11
+    setup_print(ov, "1:2")
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     wb.save(path)
@@ -462,11 +483,12 @@ def main():
     body = get(BASE + "/zh" + PATH)
     slugs = list(dict.fromkeys(re.findall(re.escape(PATH) + r"([A-Za-z0-9_\-]+)", body)))
     print(f"=== 讀取產品頁：{len(slugs)} 個 ===")
-    recs, years, failed = [], {}, []
+    recs, years, failed, seen, dups = [], {}, [], {}, []
     for slug in slugs:
         try:
-            got = parse_page(slug, get(BASE + "/zh" + PATH + slug + "/"), years)
-            if not got:
+            before = len(dups)
+            got = parse_page(slug, get(BASE + "/zh" + PATH + slug + "/"), years, seen, dups)
+            if not got and len(dups) == before:
                 failed.append(f"{slug}（沒有資料行）")
             recs.extend(got)
         except Exception as e:
@@ -476,19 +498,19 @@ def main():
         sys.exit(1)
     year = Counter(x["year"] for x in recs if x["year"]).most_common(1)
     year = year[0][0] if year else str(datetime.date.today().year - 1)
+    dups = list(dict.fromkeys(dups))
+    prods = products(recs)
 
     print("=== 各產品（行數/數值格數）===")
-    per = {}
-    for x in recs:
-        k = (x["name"], x["cat"])
-        a = per.setdefault(k, [0, 0])
-        a[0] += 1
-        a[1] += sum(1 for v in x["vals"].values() if isinstance(v, float))
-    for (name, cat), (nr, nv) in per.items():
-        print(f"  {name}｜{cat or '未識別類別'}｜{nr}/{nv}")
-    nums = sum(1 for x in recs for v in x["vals"].values() if isinstance(v, float))
+    for p in prods:
+        print(f"  {p['name']}｜{p['cat'] or '未識別類別'}｜{p['rows']}/{len(p['vals'])}")
+    nums = sum(len(p["vals"]) for p in prods)
     print("=== 核對 ===")
-    print(f"報告年度 {year}｜產品 {len(per)} 個｜資料行 {len(recs)}｜數值格 {nums}")
+    print(f"報告年度 {year}｜產品頁 {len(slugs)} 個｜產品 {len(prods)} 個（同名只算一次）｜資料行 {len(recs)}｜數值格 {nums}")
+    print(f"已略過的重複表格：{len(dups)} 個" + ("｜" + "、".join(dups) if dups else ""))
+    multi = [k for k, n in Counter((x["slug"], name_key(x["name"])) for x in recs).items() if n]
+    same = [nm for nm, n in Counter(k[1] for k in multi).items() if n > 1]
+    print(f"同名但數值不同、出現在多個產品頁的產品：{len(same)} 個" + ("｜" + "、".join(same) if same else ""))
     print("年份欄：" + "｜".join(f"{lab}={years.get(lab, '?')}" for lab in LABELS))
     for g in ["所有紅利"] + list(dict.fromkeys(group_of(x["typ"]) for x in recs)):
         rs = recs if g == "所有紅利" else [x for x in recs if group_of(x["typ"]) == g]
