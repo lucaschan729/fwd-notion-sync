@@ -184,9 +184,9 @@ def build_excel(recs, years, year, path):
     ws = wb.create_sheet(sheet_name)
 
     thin = Side(style="thin", color="D9D9D9")
-    dark = Side(style="thin", color="8C8C8C")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    first_border = Border(left=thin, right=thin, top=dark, bottom=thin)
+    sep_border = Border(bottom=Side(style="thin", color="5B9BD5"))
+    sep_fill = PatternFill("solid", fgColor="DCE6F1")
     head_fill = PatternFill("solid", fgColor=NAVY)
     green = PatternFill("solid", fgColor="E2F0D9")
     red = PatternFill("solid", fgColor="FCE4E4")
@@ -210,9 +210,9 @@ def build_excel(recs, years, year, path):
             cell.border = border
         sh.row_dimensions[row].height = height
 
-    def ratio_cell(cell, v, fmt=None, b=border):
+    def ratio_cell(cell, v, fmt=None):
         cell.alignment = center
-        cell.border = b
+        cell.border = border
         cell.fill = white
         if isinstance(v, float):
             cell.value = v
@@ -256,11 +256,17 @@ def build_excel(recs, years, year, path):
     r, prev = 6, None
     for rec in recs:
         key = name_key(rec["name"])
-        b = first_border if key != prev else border
+        if prev is not None and key != prev:
+            for c in range(1, ncol + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.fill = sep_fill
+                cell.border = sep_border
+            ws.row_dimensions[r].height = 5
+            r += 1
         prev = key
         for c, v in enumerate([rec["name"], rec["cat"], rec["cur"], rec["typ"]], 1):
             cell = ws.cell(row=r, column=c, value=v)
-            cell.border = b
+            cell.border = border
             cell.fill = white
             cell.alignment = left if c == 1 else center
             if c == 1:
@@ -272,7 +278,7 @@ def build_excel(recs, years, year, path):
             else:
                 cell.font = Font(color=TYPE_COLORS.get(group_of(rec["typ"]), "404040"))
         for c, lab in enumerate(LABELS, 5):
-            ratio_cell(ws.cell(row=r, column=c), rec["vals"].get(lab, "/"), b=b)
+            ratio_cell(ws.cell(row=r, column=c), rec["vals"].get(lab, "/"))
         ws.row_dimensions[r].height = 21
         r += 1
     ws.auto_filter.ref = f"A5:{last}{r - 1}"
@@ -365,6 +371,7 @@ def build_excel(recs, years, year, path):
     for t in ["・點上方「資料概況」的工作表名稱，可直接跳到該工作表。",
               "・產品數按產品名稱計算，同名產品只算一次。",
               "・工作表第 5 行有篩選箭嘴，可按產品種類、貨幣或紅利類型篩選。",
+              "・產品之間有淺藍色分隔行；排序會打亂分隔行，建議只用篩選。",
               "・向右或向下捲動時，標題列和產品名稱會固定不動。",
               "・平均值摘要在工作表最底部。",
               "・手機預覽未必顯示全部格式，建議下載後用 Excel App 開啟。",
